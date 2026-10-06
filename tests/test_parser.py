@@ -476,6 +476,45 @@ class FirstFailureTests(unittest.TestCase):
         self.assertEqual(cm.exception.record, 3)
         self.assertEqual(cm.exception.reason, "payload_digest_mismatch")
 
+    def test_earlier_content_error_beats_later_boundary_error(self):
+        # Record 1: valid framing, wrong block digest (content failure).
+        # Record 2: unsupported version line (boundary failure).  The
+        # earliest failure in input order must be reported, whichever
+        # validation category it belongs to.
+        first = warc_record("warcinfo", b"first", block_digest="sha256:" + "0" * 64)
+        second = warc_record("warcinfo", b"second").replace(b"WARC/1.1", b"WARC/1.0", 1)
+        with self.assertRaises(WARCAuditError) as cm:
+            audit_warc(first + second)
+        err = cm.exception
+        self.assertEqual(err.record, 1)
+        self.assertEqual(err.code, ERR_CONTENT)
+        self.assertEqual(err.reason, "block_digest_mismatch")
+
+    def test_earlier_boundary_error_beats_later_content_error(self):
+        # Mirror image: record 1 has a framing failure and record 2 a
+        # digest failure — record 1 is still the one reported.
+        first = warc_record("warcinfo", b"first").replace(b"WARC/1.1", b"WARC/1.0", 1)
+        second = warc_record("warcinfo", b"second", block_digest="sha256:" + "0" * 64)
+        with self.assertRaises(WARCAuditError) as cm:
+            audit_warc(first + second)
+        err = cm.exception
+        self.assertEqual(err.record, 1)
+        self.assertEqual(err.code, ERR_BOUNDARY)
+        self.assertEqual(err.reason, "unsupported_version")
+
+    def test_earlier_content_error_beats_record_limit(self):
+        # 501 records, the 500th with a bad digest: the record-500 failure
+        # precedes the record-501 limit failure in input order.
+        parts = [warc_record("warcinfo", b"x") for _ in range(499)]
+        parts.append(warc_record("warcinfo", b"y", block_digest="sha256:" + "0" * 64))
+        parts.append(warc_record("warcinfo", b"z"))
+        with self.assertRaises(WARCAuditError) as cm:
+            audit_warc(b"".join(parts))
+        err = cm.exception
+        self.assertEqual(err.record, 500)
+        self.assertEqual(err.code, ERR_CONTENT)
+        self.assertEqual(err.reason, "block_digest_mismatch")
+
 
 if __name__ == "__main__":
     unittest.main()
