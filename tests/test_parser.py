@@ -455,6 +455,14 @@ class RevisitReferenceTests(unittest.TestCase):
 
 
 class FirstFailureTests(unittest.TestCase):
+    def assertFirstFailure(self, data, code, reason, record):
+        with self.assertRaises(WARCAuditError) as cm:
+            audit_warc(data)
+        err = cm.exception
+        self.assertEqual(err.code, code, err.message)
+        self.assertEqual(err.reason, reason, err.message)
+        self.assertEqual(err.record, record)
+
     def test_first_failing_record_is_reported(self):
         body = b"ok"
         data = b"".join(
@@ -475,6 +483,59 @@ class FirstFailureTests(unittest.TestCase):
             audit_warc(data)
         self.assertEqual(cm.exception.record, 3)
         self.assertEqual(cm.exception.reason, "payload_digest_mismatch")
+
+    def test_content_failure_on_record_1_beats_version_failure_on_record_2(self):
+        # Record 1 is well-framed but its block digest is wrong; record 2
+        # declares an unsupported WARC version.  The verdict must follow
+        # input order: the record-1 digest failure wins regardless of its
+        # validation category.
+        first = warc_record(
+            "warcinfo", b"first", block_digest="sha256:" + "0" * 64
+        )
+        second = warc_record("warcinfo", b"second").replace(
+            b"WARC/1.1", b"WARC/1.0", 1
+        )
+        self.assertFirstFailure(
+            first + second, ERR_CONTENT, "block_digest_mismatch", 1
+        )
+
+    def test_boundary_failure_on_record_1_beats_content_failure_on_record_2(self):
+        # Mirror case: an earlier boundary error must not be hidden by a
+        # later content error either.
+        first = warc_record("warcinfo", b"first").replace(
+            b"WARC/1.1", b"WARC/1.0", 1
+        )
+        second = warc_record(
+            "warcinfo", b"second", block_digest="sha256:" + "0" * 64
+        )
+        self.assertFirstFailure(
+            first + second, ERR_BOUNDARY, "unsupported_version", 1
+        )
+
+    def test_reference_failure_beats_boundary_failure_on_a_later_record(self):
+        # Record 2 carries a dangling revisit reference; record 3's version
+        # line is unsupported.  The old two-pass parser saw all boundary
+        # errors first and wrongly reported record 3.
+        body = b"page"
+        pd = payload_digest_of(body)
+        data = b"".join(
+            [
+                warc_record(
+                    "response", http_response(body), record_id=new_record_id(),
+                    target_uri="http://e/", payload_digest=pd,
+                ),
+                warc_record(
+                    "revisit", http_response(body), target_uri="http://e/",
+                    payload_digest=pd, refers_to="<urn:uuid:deadbeef>",
+                ),
+                warc_record("warcinfo", b"third").replace(
+                    b"WARC/1.1", b"WARC/1.0", 1
+                ),
+            ]
+        )
+        self.assertFirstFailure(
+            data, ERR_CONTENT, "dangling_revisit_reference", 2
+        )
 
 
 if __name__ == "__main__":

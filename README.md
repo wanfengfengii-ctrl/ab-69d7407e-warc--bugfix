@@ -82,7 +82,7 @@ curl -s -X POST --data-binary @pkg.warc \
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v     # 42 parser unit tests
+python3 -m unittest discover -s tests -v     # 45 parser unit tests
 ```
 
 ## Docker & Docker Compose

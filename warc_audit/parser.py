@@ -15,11 +15,15 @@ from dataclasses import dataclass
 WARC_VERSION = "WARC/1.1"
 MAX_RECORDS = 500
 
-# Records are logically split into a "boundary" stage (framing + headers +
-# block length) and a "content" stage (block digest, HTTP payload, revisit
-# references).  A failure in stage one is reported with code 4001, a failure
-# in stage two with 4002, so callers can distinguish framing corruption from
-# content/reference corruption.
+# Each record is checked in two logical stages, both completed for one
+# record before the next record is read: a "boundary" stage (framing +
+# headers + block length) and a "content" stage (block digest, HTTP
+# payload, revisit references).  A failure in stage one is reported with
+# code 4001, a failure in stage two with 4002, so callers can distinguish
+# framing corruption from content/reference corruption.  Adjudicating per
+# record, rather than in two whole-archive passes, keeps the verdict
+# independent of category: the reported failure is always the one on the
+# earliest record in the input.
 ERR_BOUNDARY = 4001
 ERR_CONTENT = 4002
 
@@ -86,6 +90,13 @@ def audit_warc(data: bytes) -> AuditResult:
 
     Raises :class:`WARCAuditError` on the first error.  The empty input is
     rejected before any record is numbered.
+
+    Each record is adjudicated completely — boundary/framing first, then
+    block digest, HTTP payload and revisit reference — before the next
+    record is parsed, so the winner among errors in different validation
+    categories is decided solely by record order in the input.  Content
+    checks never need a later record: a revisit may only refer *back* to an
+    earlier response, which has by then been fully validated.
     """
     if not isinstance(data, (bytes, bytearray)):
         _fail(4000, None, "invalid_request", "request body must be raw bytes")
@@ -95,14 +106,13 @@ def audit_warc(data: bytes) -> AuditResult:
 
     pos = 0
     n = len(data)
-    records: list[tuple[RecordInfo, bytes, dict[str, bytes]]] = []
     seen_record_ids: set[bytes] = set()
+    results: list[RecordInfo] = []
+    # WARC-Record-ID -> (1-based index, payload digest) of earlier responses
+    response_by_id: dict[str, tuple[int, str]] = {}
 
-    # ------------------------------------------------------------------
-    # Stage 1: record boundaries, version, headers and block length.
-    # ------------------------------------------------------------------
     while pos < n:
-        record_no = len(records) + 1
+        record_no = len(results) + 1
         if record_no > MAX_RECORDS:
             _fail(
                 ERR_BOUNDARY,
@@ -270,72 +280,53 @@ def audit_warc(data: bytes) -> AuditResult:
                 "unexpected extra CRLF between records",
             )
 
-        records.append(
-            (
-                RecordInfo(
-                    index=record_no,
-                    warc_type=warc_type,
-                    block_length=content_length,
-                    block_digest="",  # filled in during the content stage
-                ),
-                block,
-                headers,
-            )
-        )
-
-    if not records:
-        _fail(4000, None, "empty_archive", "archive contains no records")
-
-    # ------------------------------------------------------------------
-    # Stage 2: block digests, HTTP payload digests, revisit references.
-    # ------------------------------------------------------------------
-    results: list[RecordInfo] = []
-    # WARC-Record-ID -> (1-based index, payload digest) of earlier responses
-    response_by_id: dict[str, tuple[int, str]] = {}
-
-    for partial, block, headers in records:
-        idx = partial.index
-
-        digest_value = _header_ascii(headers, "warc-block-digest", idx, required=True)
-        declared = _parse_sha256_digest(digest_value, idx, what="WARC-Block-Digest")
+        # --------------------------------------------------------------
+        # Content stage for this record: block digest, HTTP payload digest
+        # and revisit references.  Running these here — before the next
+        # record's framing is read — guarantees that, e.g., a digest
+        # failure on record 1 is not masked by a version/boundary failure
+        # on record 2.
+        # --------------------------------------------------------------
+        digest_value = _header_ascii(headers, "warc-block-digest", record_no, required=True)
+        declared = _parse_sha256_digest(digest_value, record_no, what="WARC-Block-Digest")
         actual = hashlib.sha256(block).hexdigest()
         if actual != declared:
             _fail(
                 ERR_CONTENT,
-                idx,
+                record_no,
                 "block_digest_mismatch",
                 "WARC-Block-Digest does not match the declared block bytes",
             )
 
         payload_digest: str | None = None
-        if partial.warc_type in ("response", "revisit"):
+        if warc_type in ("response", "revisit"):
             # The block is a full HTTP response message: status line, headers,
             # then the entity body bytes described by HTTP Content-Length.
             payload_bytes, http_ok, body_complete = _http_entity_body(block)
             if not http_ok:
                 _fail(
                     ERR_CONTENT,
-                    idx,
+                    record_no,
                     "invalid_http_message",
                     "record block is not a well-formed CRLF-delimited HTTP message",
                 )
-            pd_raw = _header_ascii(headers, "warc-payload-digest", idx, required=True)
-            payload_digest = _parse_sha256_digest(pd_raw, idx, what="WARC-Payload-Digest")
+            pd_raw = _header_ascii(headers, "warc-payload-digest", record_no, required=True)
+            payload_digest = _parse_sha256_digest(pd_raw, record_no, what="WARC-Payload-Digest")
 
-            if partial.warc_type == "response":
+            if warc_type == "response":
                 # A response must carry the complete entity body, which is
                 # hashed directly.  Truncation is never tolerated.
                 if not body_complete:
                     _fail(
                         ERR_CONTENT,
-                        idx,
+                        record_no,
                         "payload_truncated",
                         "HTTP entity body is shorter than its Content-Length",
                     )
                 if hashlib.sha256(payload_bytes).hexdigest() != payload_digest:
                     _fail(
                         ERR_CONTENT,
-                        idx,
+                        record_no,
                         "payload_digest_mismatch",
                         "WARC-Payload-Digest does not match the HTTP entity body",
                     )
@@ -348,25 +339,25 @@ def audit_warc(data: bytes) -> AuditResult:
                 if len(payload_bytes) > 0 and not body_complete:
                     _fail(
                         ERR_CONTENT,
-                        idx,
+                        record_no,
                         "payload_truncated",
                         "revisit carries a partial HTTP entity body",
                     )
                 if body_complete and hashlib.sha256(payload_bytes).hexdigest() != payload_digest:
                     _fail(
                         ERR_CONTENT,
-                        idx,
+                        record_no,
                         "payload_digest_mismatch",
                         "WARC-Payload-Digest does not match the HTTP entity body",
                     )
 
-        if partial.warc_type == "revisit":
-            refers_raw = _header_ascii(headers, "warc-refers-to", idx, required=True)
+        if warc_type == "revisit":
+            refers_raw = _header_ascii(headers, "warc-refers-to", record_no, required=True)
             refers_to = refers_raw.strip()
             if not _is_token(refers_to):
                 _fail(
                     ERR_CONTENT,
-                    idx,
+                    record_no,
                     "invalid_warc_refers_to",
                     "WARC-Refers-To must be the WARC-Record-ID of an earlier response",
                 )
@@ -374,7 +365,7 @@ def audit_warc(data: bytes) -> AuditResult:
             if target is None:
                 _fail(
                     ERR_CONTENT,
-                    idx,
+                    record_no,
                     "dangling_revisit_reference",
                     "WARC-Refers-To does not resolve to an earlier response record",
                 )
@@ -382,22 +373,26 @@ def audit_warc(data: bytes) -> AuditResult:
             if target_payload != payload_digest:
                 _fail(
                     ERR_CONTENT,
-                    idx,
+                    record_no,
                     "revisit_payload_mismatch",
                     "revisit payload digest differs from the referenced response",
                 )
 
-        info = RecordInfo(
-            index=idx,
-            warc_type=partial.warc_type,
-            block_length=partial.block_length,
-            block_digest=actual,
-            payload_digest=payload_digest,
+        results.append(
+            RecordInfo(
+                index=record_no,
+                warc_type=warc_type,
+                block_length=content_length,
+                block_digest=actual,
+                payload_digest=payload_digest,
+            )
         )
-        results.append(info)
-        if partial.warc_type == "response":
-            rid = headers["warc-record-id"].decode("ascii").strip()
-            response_by_id.setdefault(rid, (idx, payload_digest))  # type: ignore[arg-type]
+        if warc_type == "response":
+            rid = record_id.decode("ascii").strip()
+            response_by_id.setdefault(rid, (record_no, payload_digest))  # type: ignore[arg-type]
+
+    if not results:
+        _fail(4000, None, "empty_archive", "archive contains no records")
 
     return AuditResult(tuple(results))
 
